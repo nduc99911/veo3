@@ -12,6 +12,33 @@ interface VideoEditorProps {
   onSave: (url: string) => void;
 }
 
+// Helper for waiting
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Helper to determine supported MIME type
+const getSupportedMimeType = () => {
+  const types = [
+    'video/webm;codecs=vp9',
+    'video/webm;codecs=vp8',
+    'video/webm',
+    'video/mp4' // Safari usually supports this for recording
+  ];
+  for (const type of types) {
+    if (MediaRecorder.isTypeSupported(type)) {
+      return type;
+    }
+  }
+  return ''; // Let browser choose default if all else fails
+};
+
+// Helper to safely fetch video as Blob to bypass CORS Tainted Canvas issues
+const fetchVideoAsBlobUrl = async (url: string): Promise<string> => {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Failed to fetch video: ${response.statusText}`);
+  const blob = await response.blob();
+  return URL.createObjectURL(blob);
+};
+
 // Shared rendering logic for consistent WYSIWYG results
 const renderFrame = (
   ctx: CanvasRenderingContext2D,
@@ -68,6 +95,10 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
   const [progress, setProgress] = useState(0);
   const [showExitConfirmation, setShowExitConfirmation] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  
+  // Local Blob URL state to prevent CORS issues
+  const [localVideoSrc, setLocalVideoSrc] = useState<string | null>(null);
+  const [isLoadingSource, setIsLoadingSource] = useState(true);
 
   // Edit States
   const [trimStart, setTrimStart] = useState(0);
@@ -89,19 +120,54 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
     v.aspectRatio === video.aspectRatio
   );
 
-  // Initialize
+  // Initialize: Load video as Blob
   useEffect(() => {
-    if (videoRef.current) {
-      videoRef.current.crossOrigin = "anonymous";
-      videoRef.current.src = video.url;
-    }
+    let mounted = true;
+    const loadSource = async () => {
+      try {
+        setIsLoadingSource(true);
+        // Fetch as blob to ensure it's treated as same-origin
+        const blobUrl = await fetchVideoAsBlobUrl(video.url);
+        if (mounted) {
+          setLocalVideoSrc(blobUrl);
+          setIsLoadingSource(false);
+        }
+      } catch (err: any) {
+        console.error("Error loading source video as blob:", err);
+        if (mounted) {
+           setErrorMessage("Không thể tải video gốc. Vui lòng kiểm tra kết nối mạng.");
+           setIsLoadingSource(false);
+        }
+      }
+    };
+    
+    loadSource();
+
+    return () => {
+      mounted = false;
+      // Cleanup blob url when component unmounts or video changes
+      if (localVideoSrc) URL.revokeObjectURL(localVideoSrc);
+    };
   }, [video]);
+
+  // Assign src to video element
+  useEffect(() => {
+    if (videoRef.current && localVideoSrc) {
+      videoRef.current.src = localVideoSrc;
+      // Important: even with blob, setting crossOrigin is good practice, 
+      // though blob urls are implicitly same-origin.
+      videoRef.current.crossOrigin = "anonymous"; 
+    }
+  }, [localVideoSrc]);
 
   const handleLoadedMetadata = () => {
     if (videoRef.current) {
       const dur = videoRef.current.duration;
-      setDuration(dur);
-      setTrimEnd(dur);
+      // Only set initial duration if we haven't set it yet or if it's the first load
+      if (duration === 0) {
+        setDuration(dur);
+        setTrimEnd(dur);
+      }
       drawPreview();
     }
   };
@@ -205,6 +271,12 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
   };
 
   const processVideo = async () => {
+    console.log("Starting video export process...");
+    if (!localVideoSrc) {
+       setErrorMessage("Video nguồn chưa sẵn sàng.");
+       return;
+    }
+
     const sourceVideo = videoRef.current;
     const canvas = canvasRef.current; // Hidden canvas for processing
     if (!sourceVideo || !canvas) return;
@@ -216,66 +288,175 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
     setFailedQueueIndices(new Set());
     sourceVideo.pause();
 
+    // Ensure audio context
+    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+    const audioCtx = new AudioContextClass();
+    
+    // Helper to cleanup audio context
+    const cleanupAudio = () => {
+       if (audioCtx.state !== 'closed') audioCtx.close();
+    };
+
+    // Store Blob URLs created during merge to revoke them later
+    const tempMergeBlobs: string[] = [];
+
     try {
+      console.log(`AudioContext state before resume: ${audioCtx.state}`);
+      if (audioCtx.state === 'suspended') {
+        await audioCtx.resume();
+        console.log("AudioContext resumed.");
+      }
+
       // 1. Setup Canvas & Stream
-      canvas.width = sourceVideo.videoWidth;
-      canvas.height = sourceVideo.videoHeight;
-      const ctx = canvas.getContext('2d');
+      // Ensure canvas matches video dimensions AND IS EVEN numbers (important for encoders)
+      let width = sourceVideo.videoWidth;
+      let height = sourceVideo.videoHeight;
+      
+      // Force even dimensions
+      width = (width % 2 === 0) ? width : width - 1;
+      height = (height % 2 === 0) ? height : height - 1;
+
+      if (width <= 0 || height <= 0) {
+        throw new Error("Invalid video dimensions. Wait for video to load.");
+      }
+
+      canvas.width = width;
+      canvas.height = height;
+      console.log(`Canvas configured: ${width}x${height}`);
+      
+      const ctx = canvas.getContext('2d', { alpha: false }); // Optimize for video
       if (!ctx) throw new Error("Could not get canvas context");
+
+      // Draw one frame initially to ensure stream has data
+      ctx.drawImage(sourceVideo, 0, 0, width, height);
 
       const stream = canvas.captureStream(30); // 30 FPS
       
       // 2. Setup Audio
-      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const dest = audioCtx.createMediaStreamDestination();
       const sourceNode = audioCtx.createMediaElementSource(sourceVideo);
       sourceNode.connect(dest);
       
       // Add audio track to stream
       const audioTrack = dest.stream.getAudioTracks()[0];
-      if (audioTrack) stream.addTrack(audioTrack);
+      if (audioTrack) {
+        stream.addTrack(audioTrack);
+        console.log("Audio track added to stream.");
+      } else {
+        console.warn("No audio track found in video source");
+      }
 
       // 3. Recorder
+      // Detect supported MIME type
+      const mimeType = getSupportedMimeType();
+      console.log(`Using MIME type: ${mimeType || 'default'}`);
+
+      const recorderOptions: MediaRecorderOptions = {
+         videoBitsPerSecond: 3000000 
+      };
+      if (mimeType) {
+        recorderOptions.mimeType = mimeType;
+      }
+
       const chunks: Blob[] = [];
-      const recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+      const recorder = new MediaRecorder(stream, recorderOptions);
+
       recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
+        if (e.data && e.data.size > 0) {
+          chunks.push(e.data);
+          // console.log(`Chunk received: ${e.data.size} bytes`);
+        }
       };
 
-      recorder.start();
+      // Create a promise that resolves when recording stops
+      const recordingFinished = new Promise<void>((resolve, reject) => {
+        recorder.onstop = () => {
+          try {
+            console.log(`Recorder stopped. Total chunks: ${chunks.length}`);
+            if (chunks.length === 0) {
+              reject(new Error("No video data recorded. The stream was empty."));
+              return;
+            }
+            const blob = new Blob(chunks, { type: mimeType || 'video/webm' });
+            console.log(`Final Blob size: ${blob.size} bytes`);
+            
+            if (blob.size < 1000) {
+                 reject(new Error("Generated video file is too small/empty."));
+                 return;
+            }
+
+            const url = URL.createObjectURL(blob);
+            onSave(url);
+            resolve();
+          } catch (e) {
+            reject(e);
+          }
+        };
+        recorder.onerror = (e) => reject(e);
+      });
+
+      // Start recording with timeslice 
+      recorder.start(100); 
+      console.log("Recorder started.");
 
       // 4. Processing Loop Helper
       const playSegment = async (videoEl: HTMLVideoElement, start: number, end: number, text: string) => {
-        return new Promise<void>((resolve) => {
-          videoEl.currentTime = start;
+        console.log(`Playing segment: ${start}s -> ${end}s`);
+        return new Promise<void>((resolve, reject) => {
           
-          const onPlay = () => {
-             const processFrame = () => {
-                if (videoEl.paused || videoEl.ended) return;
+          const onFrame = () => {
+            // Check if we hit the end
+            if (videoEl.currentTime >= end) {
+               videoEl.pause();
+               resolve();
+               return;
+            }
+            
+            // Draw current frame
+            renderFrame(ctx, videoEl, text, width, height);
+            
+            // Continue loop if still playing
+            if (!videoEl.paused && !videoEl.ended) {
+               requestAnimationFrame(onFrame);
+            } else {
+               // Fallback: if paused but not reached end (buffering?), verify time
+               if (videoEl.currentTime < end) {
+                  requestAnimationFrame(onFrame);
+               } else {
+                 resolve();
+               }
+            }
+          };
 
-                // USE SHARED RENDER LOGIC
-                renderFrame(ctx, videoEl, text, canvas.width, canvas.height);
+          const startPlayback = async () => {
+            try {
+              videoEl.currentTime = start;
+              await videoEl.play();
+              onFrame();
+            } catch (e) {
+              reject(e);
+            }
+          };
 
-                // Check end condition
-                if (videoEl.currentTime >= end) {
-                  videoEl.pause();
-                  videoEl.removeEventListener('play', onPlay);
-                  resolve();
-                } else {
-                  requestAnimationFrame(processFrame);
-                }
+          // If we need to seek, wait for 'seeked'
+          if (Math.abs(videoEl.currentTime - start) > 0.1) {
+             const onSeeked = () => {
+               videoEl.removeEventListener('seeked', onSeeked);
+               startPlayback();
              };
-             processFrame();
+             videoEl.addEventListener('seeked', onSeeked);
+             videoEl.currentTime = start;
+          } else {
+             startPlayback();
           }
-
-          videoEl.addEventListener('play', onPlay);
-          videoEl.play();
         });
       };
 
       // 5. Execute Sequence
       
       // Part 1: Main Video (Trimmed)
+      // Reset to start of trim
+      sourceVideo.currentTime = trimStart;
       await playSegment(sourceVideo, trimStart, trimEnd, textOverlay);
 
       // Part 2: Merged Videos Queue
@@ -285,6 +466,11 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
          
          if (mergeVideoData) {
             try {
+                // Fetch merge video as blob first to avoid CORS
+                console.log(`Fetching merge video ${i+1}...`);
+                const mergeBlobUrl = await fetchVideoAsBlobUrl(mergeVideoData.url);
+                tempMergeBlobs.push(mergeBlobUrl);
+
                 // Load next video
                 await new Promise<void>((resolve, reject) => {
                    const loadHandler = () => {
@@ -298,21 +484,23 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
                       reject(new Error(`Failed to load video ID: ${mergeId}`));
                    };
                    
-                   // Set timeout for loading
                    const timeoutId = setTimeout(() => {
                        sourceVideo.removeEventListener('loadeddata', loadHandler);
                        sourceVideo.removeEventListener('error', errorHandler);
                        reject(new Error(`Timeout loading video ID: ${mergeId}`));
-                   }, 10000); // 10s timeout
+                   }, 15000); 
                    
                    sourceVideo.addEventListener('loadeddata', () => clearTimeout(timeoutId));
                    sourceVideo.addEventListener('error', (e) => { clearTimeout(timeoutId); errorHandler(e); });
                    sourceVideo.addEventListener('loadeddata', loadHandler);
                    
-                   sourceVideo.src = mergeVideoData.url;
+                   // Set source to local blob
+                   sourceVideo.src = mergeBlobUrl;
+                   sourceVideo.load();
                 });
 
                 // Play full next video (no text for now)
+                console.log(`Merging video ${i+1} playing...`);
                 await playSegment(sourceVideo, 0, sourceVideo.duration, '');
             } catch (err) {
                 // Mark this index as failed
@@ -321,37 +509,59 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
                     newSet.add(i);
                     return newSet;
                 });
+                console.error(err);
                 // Re-throw to stop processing loop
                 throw new Error(`Không thể tải video thứ ${i + 1} trong hàng đợi. Vui lòng kiểm tra hoặc xóa video này.`);
             }
          }
       }
 
+      // Wait a moment for the recorder to catch the last frames
+      console.log("Waiting for last frames...");
+      await delay(500);
+
       // 6. Finish
       recorder.stop();
-      recorder.onstop = () => {
-        const blob = new Blob(chunks, { type: 'video/webm' });
-        const url = URL.createObjectURL(blob);
-        onSave(url);
-        setProcessing(false);
-        
-        // Clean up audio
-        sourceNode.disconnect();
-        audioCtx.close();
-        
-        // Restore original video src for UI
-        sourceVideo.src = video.url; 
+      await recordingFinished; // Wait for the blob to be created
+
+      setProcessing(false);
+      
+      // Cleanup
+      sourceNode.disconnect();
+      cleanupAudio();
+      
+      // Clean up temporary merge blobs
+      tempMergeBlobs.forEach(url => URL.revokeObjectURL(url));
+      
+      // Restore original video src for UI from global state
+      if (localVideoSrc) {
+        sourceVideo.src = localVideoSrc; 
         sourceVideo.load();
-      };
+      }
 
     } catch (e: any) {
       console.error("Processing failed", e);
       setProcessing(false);
       setErrorMessage(e.message || "Lỗi khi xử lý video. Có thể do lỗi mạng hoặc định dạng video.");
+      cleanupAudio();
+      tempMergeBlobs.forEach(url => URL.revokeObjectURL(url));
+      
       // Restore video on error
-      sourceVideo.src = video.url;
+      if (sourceVideo && localVideoSrc) {
+        sourceVideo.src = localVideoSrc;
+        sourceVideo.load();
+      }
     }
   };
+
+  if (isLoadingSource) {
+     return (
+        <div className="flex flex-col h-full bg-slate-900 rounded-2xl border border-slate-800 items-center justify-center p-8">
+            <Loader2 className="w-12 h-12 text-blue-500 animate-spin mb-4" />
+            <p className="text-slate-400">Đang tải video nguồn...</p>
+        </div>
+     );
+  }
 
   return (
     <div className="relative flex flex-col h-full bg-slate-900 rounded-2xl border border-slate-800 overflow-hidden shadow-2xl">
@@ -398,7 +608,7 @@ const VideoEditor: React.FC<VideoEditorProps> = ({ video, allVideos, onClose, on
             <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center z-50">
                 <Loader2 className="w-12 h-12 text-blue-500 animate-spin mb-4" />
                 <p className="text-blue-400 font-mono animate-pulse">Đang Render Video...</p>
-                <p className="text-slate-500 text-sm mt-2">Đang xử lý {1 + mergeQueue.length} video segments...</p>
+                <p className="text-slate-500 text-sm mt-2">Vui lòng đợi. Quá trình có thể mất vài phút.</p>
             </div>
           )}
 

@@ -15,7 +15,7 @@ const mapErrorMessage = (error: any): string => {
     return 'Lỗi định dạng đầu vào: Prompt hoặc tham số ảnh không hợp lệ. Vui lòng kiểm tra lại.';
   }
   if (msg.includes('401') || msg.includes('unauthenticated') || msg.includes('key')) {
-    return 'Lỗi xác thực: API Key không hợp lệ hoặc đã hết hạn.';
+    return 'Lỗi xác thực: API Key không hợp lệ hoặc đã hết hạn. Vui lòng kiểm tra lại trong Cài đặt.';
   }
   if (msg.includes('403') || msg.includes('permission denied')) {
     return 'Lỗi quyền truy cập: Dự án chưa kích hoạt Billing hoặc không được phép truy cập Veo.';
@@ -33,15 +33,21 @@ const mapErrorMessage = (error: any): string => {
   return `Lỗi hệ thống: ${error.message || msg}`;
 };
 
-export const generateVideo = async (config: VideoConfig, onProgress?: (status: string) => void): Promise<string> => {
-  const result = await generateVideoRaw(config, onProgress);
+export const generateVideo = async (config: VideoConfig, onProgress?: (status: string) => void, apiKey?: string): Promise<string> => {
+  const result = await generateVideoRaw(config, onProgress, apiKey);
   return result.url;
 };
 
 // We also export a function to get the full video object for the history state
-export const generateVideoRaw = async (config: VideoConfig, onProgress?: (status: string) => void) => {
-    // Always create a new instance to ensure we capture the latest API key
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+export const generateVideoRaw = async (config: VideoConfig, onProgress?: (status: string) => void, apiKey?: string) => {
+    // Prioritize user-provided key, fallback to env if available (though env might be empty in this context)
+    const finalApiKey = apiKey || process.env.API_KEY;
+    
+    if (!finalApiKey) {
+        throw new Error("Vui lòng nhập Google API Key trong phần Cài đặt.");
+    }
+
+    const ai = new GoogleGenAI({ apiKey: finalApiKey });
     let operation;
 
     try {
@@ -79,7 +85,7 @@ export const generateVideoRaw = async (config: VideoConfig, onProgress?: (status
                 config: {
                     numberOfVideos: 1,
                     resolution: '720p', // Must be 720p
-                    aspectRatio: '16:9', // Must be 16:9
+                    aspectRatio: config.aspectRatio, // Use user selected aspect ratio (e.g. 9:16)
                     referenceImages: referenceImagesPayload,
                 }
             });
@@ -138,8 +144,9 @@ export const generateVideoRaw = async (config: VideoConfig, onProgress?: (status
         const uri = generatedVideo?.video?.uri;
         if (!uri) throw new Error("No URI returned from API");
 
+        // Append key to URL for playback authorization
         return {
-            url: `${uri}&key=${process.env.API_KEY}`,
+            url: `${uri}&key=${finalApiKey}`,
             videoObject: generatedVideo?.video
         };
     } catch (error: any) {

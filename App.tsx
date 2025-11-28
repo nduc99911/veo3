@@ -1,34 +1,37 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { 
   Video, Sparkles, Image as ImageIcon, Wand2, 
-  Settings2, Loader2, Upload, AlertTriangle, FolderOpen, Users, X, Film
+  Settings2, Loader2, Upload, AlertTriangle, FolderOpen, Users, X, Film, Key, Layers, CheckCircle2
 } from 'lucide-react';
 import { 
   VeoModel, AspectRatio, Resolution, 
   GeneratedVideo, GenerationStatus, VideoConfig 
 } from './types';
 import { generateVideoRaw } from './services/veoService';
-import ApiKeyModal from './components/ApiKeyModal';
 import VideoHistory from './components/VideoHistory';
 import VideoEditor from './components/VideoEditor';
 
 // Extend window object for AI Studio
 declare global {
-  interface AIStudio {
-    hasSelectedApiKey: () => Promise<boolean>;
-    openSelectKey: () => Promise<void>;
-  }
   interface Window {
-    showDirectoryPicker: () => Promise<FileSystemDirectoryHandle>;
+    showDirectoryPicker: (options?: any) => Promise<FileSystemDirectoryHandle>;
+  }
+
+  interface FileSystemHandle {
+    queryPermission(descriptor?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState>;
+    requestPermission(descriptor?: { mode?: 'read' | 'readwrite' }): Promise<PermissionState>;
   }
 }
 
 const App: React.FC = () => {
-  const [apiKeyReady, setApiKeyReady] = useState(false);
-  const [activeTab, setActiveTab] = useState<'create' | 'extend' | 'editor'>('create');
+  const [activeTab, setActiveTab] = useState<'create' | 'bulk' | 'extend' | 'editor'>('create');
   
+  // API Key State
+  const [userApiKey, setUserApiKey] = useState(() => localStorage.getItem('veo_api_key') || '');
+
   // Form State
   const [prompt, setPrompt] = useState('');
+  const [bulkPrompts, setBulkPrompts] = useState<string[]>(['', '', '', '', '']); // 5 scenes
   const [model, setModel] = useState<VeoModel>(VeoModel.Fast);
   const [aspectRatio, setAspectRatio] = useState<AspectRatio>(AspectRatio.Landscape);
   const [resolution, setResolution] = useState<Resolution>(Resolution.Res720p);
@@ -59,10 +62,15 @@ const App: React.FC = () => {
   const isCharacterConsistencyMode = referenceImages.length > 0;
 
   useEffect(() => {
+    localStorage.setItem('veo_api_key', userApiKey);
+  }, [userApiKey]);
+
+  useEffect(() => {
     // Auto-configure settings if character consistency is active
     if (isCharacterConsistencyMode) {
       setModel(VeoModel.Quality);
-      setAspectRatio(AspectRatio.Landscape);
+      // Note: We now allow user to select Aspect Ratio (e.g. 9:16) for consistency mode
+      // setAspectRatio(AspectRatio.Landscape); 
       setResolution(Resolution.Res720p);
     }
   }, [isCharacterConsistencyMode]);
@@ -109,11 +117,31 @@ const App: React.FC = () => {
     setReferenceImages(prev => prev.filter((_, i) => i !== index));
   };
 
+  const handleBulkPromptChange = (index: number, value: string) => {
+    const newPrompts = [...bulkPrompts];
+    newPrompts[index] = value;
+    setBulkPrompts(newPrompts);
+  };
+
   const handleSelectOutputFolder = async () => {
     try {
       if ('showDirectoryPicker' in window) {
-        const handle = await window.showDirectoryPicker();
-        setOutputDirHandle(handle);
+        // Explicitly request readwrite mode
+        const handle = await window.showDirectoryPicker({ mode: 'readwrite' });
+        
+        // We can't guarantee persistence, but we can verify current access
+        if ((await handle.queryPermission({ mode: 'readwrite' })) === 'granted') {
+          setOutputDirHandle(handle);
+          setError(null);
+        } else {
+          // Attempt to request if not granted immediately
+          if ((await handle.requestPermission({ mode: 'readwrite' })) === 'granted') {
+            setOutputDirHandle(handle);
+            setError(null);
+          } else {
+             setError("Bạn cần cấp quyền 'Ghi' (Write) để ứng dụng có thể tự động lưu video.");
+          }
+        }
       } else {
         setError("Trình duyệt của bạn không hỗ trợ chọn thư mục (File System Access API).");
       }
@@ -126,7 +154,10 @@ const App: React.FC = () => {
     if (!outputDirHandle) return;
     try {
       setStatusMessage(`Đang lưu vào thư mục: ${outputDirHandle.name}...`);
+      
       const response = await fetch(url);
+      if (!response.ok) throw new Error(`Lỗi tải video từ server (Status: ${response.status})`);
+      
       const blob = await response.blob();
       
       const fileHandle = await outputDirHandle.getFileHandle(filename, { create: true });
@@ -134,64 +165,112 @@ const App: React.FC = () => {
       await writable.write(blob);
       await writable.close();
       console.log("File saved successfully to folder.");
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error saving to folder:", err);
-      setError("Không thể lưu file vào thư mục đã chọn. Vui lòng kiểm tra quyền truy cập.");
+      // Soft error - do not disrupt the app flow
+      setError(`Không thể lưu file vào thư mục "${outputDirHandle.name}". Vui lòng kiểm tra quyền truy cập.`);
+      
+      if (err.name === 'NotAllowedError' || err.message.includes('permission')) {
+          setOutputDirHandle(null);
+      }
     }
   };
 
+  const generateSingle = async (cfg: VideoConfig, label: string): Promise<GeneratedVideo> => {
+     const result = await generateVideoRaw(cfg, setStatusMessage, userApiKey);
+     const timestamp = Date.now();
+     const filename = `veo-${label.replace(/\s+/g, '-')}-${timestamp}.mp4`;
+     
+     if (outputDirHandle) {
+        await saveToDisk(result.url, filename);
+     }
+
+     return {
+        id: timestamp.toString(),
+        url: result.url,
+        prompt: cfg.prompt,
+        createdAt: new Date(),
+        model: isCharacterConsistencyMode ? 'veo-3.1-generate-preview (Character)' : cfg.model,
+        videoObject: result.videoObject,
+        aspectRatio: cfg.aspectRatio,
+     };
+  };
+
   const handleGenerate = async () => {
-    if (!prompt.trim() && !imageStart && referenceImages.length === 0) {
-      setError("Vui lòng nhập mô tả hoặc tải lên hình ảnh.");
+    if (!userApiKey.trim()) {
+      setError("Vui lòng nhập API Key trong phần Cài đặt bên phải.");
       return;
     }
 
     setStatus('generating');
     setError(null);
-    setStatusMessage('Đang khởi tạo yêu cầu...');
 
     try {
-      const config: VideoConfig = {
-        prompt,
-        model,
-        aspectRatio,
-        resolution,
-        imageStart: imageStart || undefined,
-        imageEnd: imageEnd || undefined,
-        referenceImages: referenceImages.length > 0 ? referenceImages : undefined,
-      };
+        if (activeTab === 'bulk') {
+            const activeIndices = bulkPrompts.map((p, i) => p.trim() ? i : -1).filter(i => i !== -1);
+            if (activeIndices.length === 0) {
+                throw new Error("Vui lòng nhập ít nhất một mô tả phân cảnh.");
+            }
 
-      if (activeTab === 'extend') {
-        if (!selectedVideoToExtend) {
-          throw new Error("Vui lòng chọn một video từ lịch sử để mở rộng.");
+            for (let i = 0; i < activeIndices.length; i++) {
+                const idx = activeIndices[i];
+                const scenePrompt = bulkPrompts[idx];
+                const currentSceneNum = i + 1;
+                const totalScenes = activeIndices.length;
+
+                setStatusMessage(`Đang xử lý Cảnh ${currentSceneNum}/${totalScenes}...`);
+
+                const config: VideoConfig = {
+                    prompt: scenePrompt,
+                    model: model, 
+                    aspectRatio: aspectRatio, 
+                    resolution: resolution,
+                    referenceImages: referenceImages.length > 0 ? referenceImages : undefined,
+                };
+                
+                try {
+                    const newVideo = await generateSingle(config, `scene-${idx + 1}`);
+                    setVideos(prev => [newVideo, ...prev]);
+                } catch (sceneErr: any) {
+                    console.error(`Error generating scene ${idx+1}:`, sceneErr);
+                    // We continue to next scene even if one fails, but show toast?
+                    // For now just log and set global error but continue
+                    setError(`Lỗi tạo cảnh ${idx+1}: ${sceneErr.message}`);
+                }
+            }
+
+        } else {
+            // Single Generation Logic
+            if (!prompt.trim() && !imageStart && referenceImages.length === 0) {
+                throw new Error("Vui lòng nhập mô tả hoặc tải lên hình ảnh.");
+            }
+            
+            setStatusMessage('Đang khởi tạo yêu cầu...');
+
+            const config: VideoConfig = {
+                prompt,
+                model,
+                aspectRatio,
+                resolution,
+                imageStart: imageStart || undefined,
+                imageEnd: imageEnd || undefined,
+                referenceImages: referenceImages.length > 0 ? referenceImages : undefined,
+            };
+    
+            if (activeTab === 'extend') {
+                if (!selectedVideoToExtend) {
+                  throw new Error("Vui lòng chọn một video từ lịch sử để mở rộng.");
+                }
+                config.previousVideo = selectedVideoToExtend.videoObject;
+                config.model = VeoModel.Quality;
+            }
+    
+            const newVideo = await generateSingle(config, activeTab === 'extend' ? 'extended' : 'gen');
+            setVideos(prev => [newVideo, ...prev]);
         }
-        config.previousVideo = selectedVideoToExtend.videoObject;
-        config.model = VeoModel.Quality;
-      }
 
-      // Pass setStatusMessage to receive granular updates
-      const result = await generateVideoRaw(config, setStatusMessage);
-
-      const timestamp = Date.now();
-      const filename = `veo-video-${timestamp}.mp4`;
-
-      const newVideo: GeneratedVideo = {
-        id: timestamp.toString(),
-        url: result.url,
-        prompt: prompt || 'Video từ hình ảnh',
-        createdAt: new Date(),
-        model: isCharacterConsistencyMode ? 'veo-3.1-generate-preview (Character)' : config.model,
-        videoObject: result.videoObject,
-        aspectRatio: isCharacterConsistencyMode ? AspectRatio.Landscape : config.aspectRatio,
-      };
-
-      // Auto save if folder selected
-      if (outputDirHandle) {
-        await saveToDisk(result.url, filename);
-      }
-
-      setVideos(prev => [newVideo, ...prev]);
       setStatus('completed');
+      
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Đã xảy ra lỗi không xác định.");
@@ -200,11 +279,9 @@ const App: React.FC = () => {
   };
 
   const onExtendRequest = (video: GeneratedVideo) => {
-    // Reset incompatible states for extension
     setImageStart(null);
     setImageEnd(null);
     setReferenceImages([]);
-    
     setSelectedVideoToExtend(video);
     setActiveTab('extend');
     setAspectRatio(video.aspectRatio as AspectRatio); 
@@ -229,19 +306,50 @@ const App: React.FC = () => {
       aspectRatio: selectedVideoToEdit?.aspectRatio || AspectRatio.Landscape,
     };
     
-    // Auto save edit if output dir is present
-    if (outputDirHandle) {
-       await saveToDisk(url, `veo-edited-${timestamp}.webm`);
-    }
-
     setVideos(prev => [newVideo, ...prev]);
     setActiveTab('create');
     setSelectedVideoToEdit(null);
+
+    if (outputDirHandle) {
+       await saveToDisk(url, `veo-edited-${timestamp}.webm`);
+    }
   };
 
-  if (!apiKeyReady) {
-    return <ApiKeyModal onKeySelected={() => setApiKeyReady(true)} />;
-  }
+  // Render Logic for Inputs
+  const renderReferenceImagesInput = () => (
+    <div className="pt-4 border-t border-slate-800">
+        <label className="flex items-center gap-2 text-sm font-semibold text-blue-300 uppercase tracking-wider mb-3">
+        <Users className="w-4 h-4" /> Đồng bộ Nhân vật (Tối đa 3 ảnh)
+        </label>
+        <p className="text-xs text-slate-500 mb-3">
+            Tải lên hình ảnh tham chiếu để giữ nhân vật nhất quán giữa các cảnh. <br/>
+            <span className="text-amber-500">Lưu ý: Tính năng này yêu cầu Veo Quality và 720p. Tỷ lệ 16:9 hoặc 9:16.</span>
+        </p>
+        
+        <div className="flex gap-3 overflow-x-auto pb-2">
+            {referenceImages.map((img, idx) => (
+                <div key={idx} className="relative w-20 h-20 shrink-0 rounded-lg overflow-hidden border border-slate-700 group">
+                    <img src={`data:image/png;base64,${img}`} className="w-full h-full object-cover" alt={`Ref ${idx}`} />
+                    <button 
+                        onClick={() => removeReferenceImage(idx)}
+                        className="absolute top-0 right-0 bg-red-500/80 p-1 rounded-bl text-white opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                        <X className="w-3 h-3" />
+                    </button>
+                </div>
+            ))}
+            {referenceImages.length < 3 && (
+                <button 
+                    onClick={() => fileInputRefRef.current?.click()}
+                    className="w-20 h-20 shrink-0 rounded-lg border-2 border-dashed border-slate-700 hover:border-blue-500 bg-slate-950 flex items-center justify-center transition-colors"
+                >
+                    <Users className="w-6 h-6 text-slate-600" />
+                </button>
+            )}
+        </div>
+        <input type="file" ref={fileInputRefRef} onChange={handleReferenceImageAdd} className="hidden" accept="image/*" />
+    </div>
+  );
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-50 font-sans selection:bg-blue-500/30">
@@ -277,7 +385,7 @@ const App: React.FC = () => {
             Biến ý tưởng thành Video
           </h1>
           <p className="text-slate-400 max-w-2xl mx-auto text-lg">
-            Sử dụng sức mạnh của Google Veo 3 để tạo ra các video điện ảnh 1080p, mở rộng clip có sẵn, hoặc tạo chuyển động từ hình ảnh tĩnh.
+            Sử dụng sức mạnh của Google Veo 3 để tạo ra các video điện ảnh 1080p, mở rộng clip, hoặc tạo hàng loạt phân cảnh.
           </p>
         </div>
 
@@ -311,6 +419,18 @@ const App: React.FC = () => {
                   </div>
                 </button>
                 <button
+                  onClick={() => setActiveTab('bulk')}
+                  className={`flex-1 py-2 px-4 rounded-lg text-sm font-medium transition-all ${
+                    activeTab === 'bulk' 
+                      ? 'bg-slate-800 text-white shadow-sm' 
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-center gap-2">
+                    <Layers className="w-4 h-4" /> Hàng Loạt
+                  </div>
+                </button>
+                <button
                   onClick={() => setActiveTab('extend')}
                   className={`flex-1 py-2 px-4 rounded-lg text-sm font-medium transition-all ${
                     activeTab === 'extend' 
@@ -319,7 +439,7 @@ const App: React.FC = () => {
                   }`}
                 >
                   <div className="flex items-center justify-center gap-2">
-                    <Wand2 className="w-4 h-4" /> Mở Rộng Video
+                    <Wand2 className="w-4 h-4" /> Mở Rộng
                   </div>
                 </button>
               </div>
@@ -327,104 +447,107 @@ const App: React.FC = () => {
               {/* Form */}
               <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-6 space-y-6">
                 
-                {/* Prompt Input */}
-                <div>
-                  <label className="block text-sm font-medium text-slate-300 mb-2">
-                    Mô tả ý tưởng của bạn (Prompt)
-                  </label>
-                  <textarea
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                    placeholder={activeTab === 'extend' ? "Mô tả điều gì xảy ra tiếp theo..." : "Một con mèo máy đang lướt ván trong thành phố tương lai cyberpunk, đèn neon rực rỡ..."}
-                    className="w-full h-32 bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-100 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none transition-all"
-                  />
-                </div>
+                {activeTab === 'bulk' ? (
+                    <div className="space-y-6">
+                        <div className="bg-blue-900/20 border border-blue-800 rounded-lg p-4">
+                            <h4 className="text-sm font-bold text-blue-300 mb-2 flex items-center gap-2">
+                                <Layers className="w-4 h-4" /> Chế độ Tạo Hàng Loạt (Bulk)
+                            </h4>
+                            <p className="text-sm text-slate-400">
+                                Nhập tối đa 5 phân cảnh khác nhau. Hệ thống sẽ tạo lần lượt từng video theo cài đặt bên phải (9:16, 16:9...).
+                            </p>
+                        </div>
+                        
+                        <div className="space-y-4">
+                            {bulkPrompts.map((p, idx) => (
+                                <div key={idx} className="relative">
+                                    <div className="absolute left-3 top-3 w-6 h-6 rounded-full bg-slate-800 flex items-center justify-center text-xs text-slate-400 font-bold border border-slate-700">
+                                        {idx + 1}
+                                    </div>
+                                    <textarea
+                                        value={p}
+                                        onChange={(e) => handleBulkPromptChange(idx, e.target.value)}
+                                        placeholder={`Mô tả phân cảnh ${idx + 1}...`}
+                                        className="w-full h-20 bg-slate-950 border border-slate-700 rounded-xl pl-12 pr-4 py-3 text-slate-100 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none text-sm"
+                                    />
+                                </div>
+                            ))}
+                        </div>
 
-                {/* Create Mode Inputs */}
-                {activeTab === 'create' && (
-                  <div className="space-y-6">
-                      {/* Standard Image Inputs */}
-                      <div className="grid grid-cols-2 gap-4">
-                          <div>
-                              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-                              Ảnh Bắt đầu (Start)
-                              </label>
-                              <div 
-                              onClick={() => fileInputStartRef.current?.click()}
-                              className={`h-24 border-2 border-dashed rounded-xl flex flex-col items-center justify-center cursor-pointer transition-all overflow-hidden ${
-                                  imageStart ? 'border-blue-500 bg-blue-500/10' : 'border-slate-700 hover:border-slate-500 bg-slate-950'
-                              }`}
-                              >
-                              {imageStart ? (
-                                  <img src={`data:image/png;base64,${imageStart}`} alt="Start" className="h-full w-full object-cover" />
-                              ) : (
-                                  <>
-                                  <ImageIcon className="w-5 h-5 text-slate-500 mb-1" />
-                                  <span className="text-xs text-slate-500">Tải ảnh</span>
-                                  </>
-                              )}
-                              </div>
-                              <input type="file" ref={fileInputStartRef} onChange={(e) => handleFileChange(e, setImageStart)} className="hidden" accept="image/*" />
-                              {imageStart && <button onClick={(e) => {e.stopPropagation(); setImageStart(null)}} className="text-xs text-red-400 mt-1 hover:underline">Xóa</button>}
-                          </div>
+                        {renderReferenceImagesInput()}
+                    </div>
+                ) : (
+                    /* Standard & Extend Inputs */
+                    <>
+                        {/* Prompt Input */}
+                        <div>
+                        <label className="block text-sm font-medium text-slate-300 mb-2">
+                            Mô tả ý tưởng của bạn (Prompt)
+                        </label>
+                        <textarea
+                            value={prompt}
+                            onChange={(e) => setPrompt(e.target.value)}
+                            placeholder={activeTab === 'extend' ? "Mô tả điều gì xảy ra tiếp theo..." : "Một con mèo máy đang lướt ván trong thành phố tương lai cyberpunk, đèn neon rực rỡ..."}
+                            className="w-full h-32 bg-slate-950 border border-slate-700 rounded-xl p-4 text-slate-100 placeholder:text-slate-600 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none transition-all"
+                        />
+                        </div>
 
-                          <div>
-                              <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
-                              Ảnh Kết thúc (End)
-                              </label>
-                              <div 
-                              onClick={() => fileInputEndRef.current?.click()}
-                              className={`h-24 border-2 border-dashed rounded-xl flex flex-col items-center justify-center cursor-pointer transition-all overflow-hidden ${
-                                  imageEnd ? 'border-purple-500 bg-purple-500/10' : 'border-slate-700 hover:border-slate-500 bg-slate-950'
-                              }`}
-                              >
-                              {imageEnd ? (
-                                  <img src={`data:image/png;base64,${imageEnd}`} alt="End" className="h-full w-full object-cover" />
-                              ) : (
-                                  <>
-                                  <ImageIcon className="w-5 h-5 text-slate-500 mb-1" />
-                                  <span className="text-xs text-slate-500">Tải ảnh</span>
-                                  </>
-                              )}
-                              </div>
-                              <input type="file" ref={fileInputEndRef} onChange={(e) => handleFileChange(e, setImageEnd)} className="hidden" accept="image/*" />
-                              {imageEnd && <button onClick={(e) => {e.stopPropagation(); setImageEnd(null)}} className="text-xs text-red-400 mt-1 hover:underline">Xóa</button>}
-                          </div>
-                      </div>
+                        {/* Create Mode Inputs */}
+                        {activeTab === 'create' && (
+                        <div className="space-y-6">
+                            {/* Standard Image Inputs */}
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                                    Ảnh Bắt đầu (Start)
+                                    </label>
+                                    <div 
+                                    onClick={() => fileInputStartRef.current?.click()}
+                                    className={`h-24 border-2 border-dashed rounded-xl flex flex-col items-center justify-center cursor-pointer transition-all overflow-hidden ${
+                                        imageStart ? 'border-blue-500 bg-blue-500/10' : 'border-slate-700 hover:border-slate-500 bg-slate-950'
+                                    }`}
+                                    >
+                                    {imageStart ? (
+                                        <img src={`data:image/png;base64,${imageStart}`} alt="Start" className="h-full w-full object-cover" />
+                                    ) : (
+                                        <>
+                                        <ImageIcon className="w-5 h-5 text-slate-500 mb-1" />
+                                        <span className="text-xs text-slate-500">Tải ảnh</span>
+                                        </>
+                                    )}
+                                    </div>
+                                    <input type="file" ref={fileInputStartRef} onChange={(e) => handleFileChange(e, setImageStart)} className="hidden" accept="image/*" />
+                                    {imageStart && <button onClick={(e) => {e.stopPropagation(); setImageStart(null)}} className="text-xs text-red-400 mt-1 hover:underline">Xóa</button>}
+                                </div>
 
-                      {/* Character Consistency Input */}
-                      <div className="pt-4 border-t border-slate-800">
-                          <label className="flex items-center gap-2 text-sm font-semibold text-blue-300 uppercase tracking-wider mb-3">
-                            <Users className="w-4 h-4" /> Đồng bộ Nhân vật (Tối đa 3 ảnh)
-                          </label>
-                          <p className="text-xs text-slate-500 mb-3">
-                              Tải lên hình ảnh tham chiếu để giữ nhân vật nhất quán. Chế độ này yêu cầu Veo Quality (chậm hơn) và tỷ lệ 16:9 720p.
-                          </p>
-                          
-                          <div className="flex gap-3 overflow-x-auto pb-2">
-                              {referenceImages.map((img, idx) => (
-                                  <div key={idx} className="relative w-20 h-20 shrink-0 rounded-lg overflow-hidden border border-slate-700 group">
-                                      <img src={`data:image/png;base64,${img}`} className="w-full h-full object-cover" alt={`Ref ${idx}`} />
-                                      <button 
-                                          onClick={() => removeReferenceImage(idx)}
-                                          className="absolute top-0 right-0 bg-red-500/80 p-1 rounded-bl text-white opacity-0 group-hover:opacity-100 transition-opacity"
-                                      >
-                                          <X className="w-3 h-3" />
-                                      </button>
-                                  </div>
-                              ))}
-                              {referenceImages.length < 3 && (
-                                  <button 
-                                      onClick={() => fileInputRefRef.current?.click()}
-                                      className="w-20 h-20 shrink-0 rounded-lg border-2 border-dashed border-slate-700 hover:border-blue-500 bg-slate-950 flex items-center justify-center transition-colors"
-                                  >
-                                      <Users className="w-6 h-6 text-slate-600" />
-                                  </button>
-                              )}
-                          </div>
-                          <input type="file" ref={fileInputRefRef} onChange={handleReferenceImageAdd} className="hidden" accept="image/*" />
-                      </div>
-                  </div>
+                                <div>
+                                    <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2">
+                                    Ảnh Kết thúc (End)
+                                    </label>
+                                    <div 
+                                    onClick={() => fileInputEndRef.current?.click()}
+                                    className={`h-24 border-2 border-dashed rounded-xl flex flex-col items-center justify-center cursor-pointer transition-all overflow-hidden ${
+                                        imageEnd ? 'border-purple-500 bg-purple-500/10' : 'border-slate-700 hover:border-slate-500 bg-slate-950'
+                                    }`}
+                                    >
+                                    {imageEnd ? (
+                                        <img src={`data:image/png;base64,${imageEnd}`} alt="End" className="h-full w-full object-cover" />
+                                    ) : (
+                                        <>
+                                        <ImageIcon className="w-5 h-5 text-slate-500 mb-1" />
+                                        <span className="text-xs text-slate-500">Tải ảnh</span>
+                                        </>
+                                    )}
+                                    </div>
+                                    <input type="file" ref={fileInputEndRef} onChange={(e) => handleFileChange(e, setImageEnd)} className="hidden" accept="image/*" />
+                                    {imageEnd && <button onClick={(e) => {e.stopPropagation(); setImageEnd(null)}} className="text-xs text-red-400 mt-1 hover:underline">Xóa</button>}
+                                </div>
+                            </div>
+
+                            {renderReferenceImagesInput()}
+                        </div>
+                        )}
+                    </>
                 )}
 
                 {/* Extension Mode Info */}
@@ -475,8 +598,11 @@ const App: React.FC = () => {
                     </>
                   ) : (
                     <>
-                      {activeTab === 'extend' ? <Upload className="w-5 h-5" /> : <Sparkles className="w-5 h-5" />}
-                      {activeTab === 'extend' ? 'Mở Rộng Video' : 'Tạo Video'}
+                      {activeTab === 'extend' && <Upload className="w-5 h-5" />}
+                      {activeTab === 'bulk' && <Layers className="w-5 h-5" />}
+                      {activeTab === 'create' && <Sparkles className="w-5 h-5" />}
+                      
+                      {activeTab === 'extend' ? 'Mở Rộng Video' : activeTab === 'bulk' ? 'Tạo Hàng Loạt' : 'Tạo Video'}
                     </>
                   )}
                 </button>
@@ -492,6 +618,23 @@ const App: React.FC = () => {
                 </h3>
 
                 <div className="space-y-6">
+
+                  {/* API Key Setting */}
+                  <div className="pb-6 border-b border-slate-800">
+                    <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 block flex items-center gap-1">
+                      <Key className="w-3 h-3" /> API Key
+                    </label>
+                    <input 
+                      type="password"
+                      value={userApiKey}
+                      onChange={(e) => setUserApiKey(e.target.value)}
+                      placeholder="Dán API Key vào đây..."
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-slate-200 text-sm focus:outline-none focus:border-blue-500 font-mono"
+                    />
+                    <p className="text-[10px] text-slate-500 mt-2">
+                       Key được lưu cục bộ trên trình duyệt của bạn.
+                    </p>
+                  </div>
                   
                   {/* Output Folder Selection */}
                   <div className="pb-6 border-b border-slate-800">
@@ -535,7 +678,7 @@ const App: React.FC = () => {
                         <input type="radio" name="model" className="hidden" checked={model === VeoModel.Fast} onChange={() => setModel(VeoModel.Fast)} disabled={activeTab === 'extend' || isCharacterConsistencyMode} />
                       </label>
 
-                      <label className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-all ${model === VeoModel.Quality ? 'bg-purple-600/10 border-purple-500/50' : 'bg-slate-950 border-slate-800 hover:border-slate-700'}`}>
+                      <label className={`flex items-center justify-between p-3 rounded-lg border cursor-pointer transition-all ${model === VeoModel.Quality ? 'bg-purple-600/10 border-purple-500/50' : 'bg-slate-950 border-slate-800 hover:border-slate-700'} ${isCharacterConsistencyMode ? 'bg-purple-600/10 border-purple-500/50' : ''}`}>
                         <div className="flex items-center gap-3">
                           <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${model === VeoModel.Quality ? 'border-purple-500' : 'border-slate-600'}`}>
                             {model === VeoModel.Quality && <div className="w-2 h-2 bg-purple-500 rounded-full" />}
@@ -558,16 +701,16 @@ const App: React.FC = () => {
                     <div className="grid grid-cols-2 gap-3">
                       <button 
                         onClick={() => setAspectRatio(AspectRatio.Landscape)}
-                        disabled={activeTab === 'extend' || isCharacterConsistencyMode}
-                        className={`p-3 rounded-lg border flex flex-col items-center gap-2 transition-all ${aspectRatio === AspectRatio.Landscape ? 'bg-blue-600/10 border-blue-500 text-blue-400' : 'bg-slate-950 border-slate-800 text-slate-500 hover:border-slate-700'} ${isCharacterConsistencyMode && aspectRatio !== AspectRatio.Landscape ? 'opacity-50' : ''}`}
+                        disabled={activeTab === 'extend'}
+                        className={`p-3 rounded-lg border flex flex-col items-center gap-2 transition-all ${aspectRatio === AspectRatio.Landscape ? 'bg-blue-600/10 border-blue-500 text-blue-400' : 'bg-slate-950 border-slate-800 text-slate-500 hover:border-slate-700'}`}
                       >
                         <div className="w-8 h-5 border-2 border-current rounded-sm"></div>
                         <span className="text-xs font-medium">16:9 (Ngang)</span>
                       </button>
                       <button 
                         onClick={() => setAspectRatio(AspectRatio.Portrait)}
-                        disabled={activeTab === 'extend' || isCharacterConsistencyMode}
-                        className={`p-3 rounded-lg border flex flex-col items-center gap-2 transition-all ${aspectRatio === AspectRatio.Portrait ? 'bg-blue-600/10 border-blue-500 text-blue-400' : 'bg-slate-950 border-slate-800 text-slate-500 hover:border-slate-700'} ${isCharacterConsistencyMode ? 'opacity-50 cursor-not-allowed' : ''}`}
+                        disabled={activeTab === 'extend'}
+                        className={`p-3 rounded-lg border flex flex-col items-center gap-2 transition-all ${aspectRatio === AspectRatio.Portrait ? 'bg-blue-600/10 border-blue-500 text-blue-400' : 'bg-slate-950 border-slate-800 text-slate-500 hover:border-slate-700'}`}
                       >
                         <div className="w-5 h-8 border-2 border-current rounded-sm"></div>
                         <span className="text-xs font-medium">9:16 (Dọc)</span>
